@@ -1,75 +1,29 @@
+import os
+import hmac
+import hashlib
 import base64
-import pyotp
+import time
 
+def load_seed():
+    path = "/data/seed.txt"
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return f.read().strip()
 
-def _hex_seed_to_base32(hex_seed: str) -> str:
-    """
-    Convert 64-char hex seed to base32 string for TOTP
-    """
-    # 1. hex -> bytes
-    seed_bytes = bytes.fromhex(hex_seed)
+def generate_totp_code(hex_seed: str, interval=30):
+    key = bytes.fromhex(hex_seed)
+    timestep = int(time.time()) // interval
+    msg = timestep.to_bytes(8, "big")
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (int.from_bytes(h[o:o+4], "big") & 0x7fffffff) % 1000000
+    return f"{code:06d}"
 
-    # 2. bytes -> base32 (returns bytes)
-    base32_bytes = base64.b32encode(seed_bytes)
-
-    # 3. bytes -> str
-    return base32_bytes.decode("utf-8")
-
-
-def generate_totp_code(hex_seed: str) -> str:
-    """
-    Generate current TOTP code from hex seed
-
-    Args:
-        hex_seed: 64-character hex string
-
-    Returns:
-        6-digit TOTP code as string
-    """
-    # 1 & 2. Convert hex seed to base32
-    base32_seed = _hex_seed_to_base32(hex_seed)
-
-    # 3. Create TOTP object (default: SHA-1, 30s, 6 digits)
-    totp = pyotp.TOTP(base32_seed)
-
-    # 4. Generate current TOTP
-    code = totp.now()  # returns a 6-digit string like "123456"
-
-    # 5. Return code
-    return code
-
-
-def verify_totp_code(hex_seed: str, code: str, valid_window: int = 1) -> bool:
-    """
-    Verify TOTP code with time window tolerance
-
-    Args:
-        hex_seed: 64-character hex string
-        code: 6-digit code to verify
-        valid_window: Number of periods before/after to accept (default 1 = ±30s)
-
-    Returns:
-        True if code is valid, False otherwise
-    """
-    # 1. Convert hex seed to base32
-    base32_seed = _hex_seed_to_base32(hex_seed)
-
-    # 2. Create TOTP object
-    totp = pyotp.TOTP(base32_seed)
-
-    # 3. Verify with time window tolerance
-    # valid_window=1 means current 30s window ±1 step (so ~±30s)
-    is_valid = totp.verify(code, valid_window=valid_window)
-
-    # 4. Return result
-    return is_valid
-from totp_utils import generate_totp_code, verify_totp_code
-
-# Example: read your real seed from /data/seed.txt (or local seed file)
-with open("/data/seed.txt", "r") as f:
-    hex_seed = f.read().strip()
-
-code = generate_totp_code(hex_seed)
-print("Current TOTP code:", code)
-
-print("Verification result:", verify_totp_code(hex_seed, code))
+def verify_totp_code(hex_seed: str, code: str, valid_window=1):
+    now = int(time.time() // 30)
+    for offset in range(-valid_window, valid_window + 1):
+        expected = generate_totp_code(hex_seed, interval=30)
+        if expected == code:
+            return True
+    return False

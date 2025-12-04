@@ -1,16 +1,26 @@
 import os
 import time
-from fastapi import FastAPI, HTTPException
+import base64
+import string
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from decrypt_seed import load_private_key, decrypt_seed
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+
 from totp_utils import generate_totp_code, verify_totp_code
 
 app = FastAPI()
 
+SEED_PATH = "/data/seed.txt"
+PRIVATE_KEY_PATH = "student_private.pem"
 
-# ---------- Request Models ----------
 
+# -----------------------------
+# Pydantic Models
+# -----------------------------
 class DecryptSeedRequest(BaseModel):
     encrypted_seed: str
 
@@ -19,108 +29,150 @@ class Verify2FARequest(BaseModel):
     code: str | None = None
 
 
-SEED_PATH = "/data/seed.txt"
-
-
+# -----------------------------
+# Helper Functions
+# -----------------------------
 def seed_exists() -> bool:
     return os.path.exists(SEED_PATH)
 
 
 def read_seed() -> str:
-    if not seed_exists():
-        raise FileNotFoundError("Seed not decrypted yet")
     with open(SEED_PATH, "r") as f:
         return f.read().strip()
 
 
-# ---------- Endpoint 1: POST /decrypt-seed ----------
+def load_private_key(path: str = PRIVATE_KEY_PATH):
+    """Load RSA private key from PEM file."""
+    with open(path, "rb") as key_file:
+        return serialization.load_pem_private_key(
+            key_file.read(),
+            password=None,
+        )
+
+
+def decrypt_encrypted_seed(encrypted_seed_b64: str) -> str:
+    """
+    Decrypt base64-encoded encrypted seed using RSA/OAEP-SHA256
+    and return a 64-character hex string.
+    """
+    private_key = load_private_key(PRIVATE_KEY_PATH)
+
+    # 1. Base64 decode
+    ciphertext = base64.b64decode(encrypted_seed_b64)
+
+    # 2. RSA/OAEP decrypt with SHA-256
+    plaintext = private_key.decrypt(
+        ciphertext,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    # 3. Decode as UTF-8 string
+    hex_seed = plaintext.decode("utf-8").strip()
+
+    # 4. Validate 64-char hex
+    if len(hex_seed) != 64 or any(c not in string.hexdigits for c in hex_seed):
+        raise ValueError("Decrypted seed is not a valid 64-character hex string")
+
+    return hex_seed
+
+
+def decrypt_and_store_seed(encrypted_seed_b64: str) -> None:
+    """
+    Decrypt encrypted seed and store hex seed into /data/seed.txt.
+    """
+    hex_seed = decrypt_encrypted_seed(encrypted_seed_b64)
+
+    os.makedirs(os.path.dirname(SEED_PATH), exist_ok=True)
+    with open(SEED_PATH, "w") as f:
+        f.write(hex_seed + "\n")
+
+
+# -----------------------------
+# Endpoints
+# -----------------------------
 
 @app.post("/decrypt-seed")
 def decrypt_seed_endpoint(body: DecryptSeedRequest):
+    """
+    1) Decrypt encrypted_seed using student_private.pem
+    2) Store hex seed in /data/seed.txt
+    """
     try:
-        # Load private key
-        private_key = load_private_key("student_private.pem")
-
-        # Decrypt seed
-        seed_hex = decrypt_seed(body.encrypted_seed, private_key)
-
-        # Ensure /data directory exists
-        os.makedirs(os.path.dirname(SEED_PATH), exist_ok=True)
-
-        # Save to /data/seed.txt
-        with open(SEED_PATH, "w") as f:
-            f.write(seed_hex + "\n")
-
+        decrypt_and_store_seed(body.encrypted_seed)
         return {"status": "ok"}
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Decryption failed"},
+        )
 
-    except Exception as e:
-        # For security, don't leak internal error details
-        print("Decryption error:", e)
-        raise HTTPException(status_code=500, detail={"error": "Decryption failed"})
-
-
-# ---------- Endpoint 2: GET /generate-2fa ----------
 
 @app.get("/generate-2fa")
 def generate_2fa():
-    try:
-        if not seed_exists():
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Seed not decrypted yet"},
-            )
-
-        hex_seed = read_seed()
-
-        # Generate TOTP code
-        code = generate_totp_code(hex_seed)
-
-        # Calculate remaining seconds in current 30s period (0–29)
-        now = int(time.time())
-        elapsed = now % 30
-        valid_for = 30 - elapsed
-        if valid_for == 30:
-            valid_for = 0
-
-        return {
-            "code": code,
-            "valid_for": valid_for,
+    """
+    Generate current TOTP code from stored seed.
+    Returns:
+        {
+          "code": "123456",
+          "valid_for": <seconds_remaining_in_30s_window>
         }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("Generate 2FA error:", e)
-        raise HTTPException(status_code=500, detail={"error": "Seed not decrypted yet"})
-
-
-# ---------- Endpoint 3: POST /verify-2fa ----------
-
-@app.post("/verify-2fa")
-def verify_2fa(body: Verify2FARequest):
-    # Validate code provided
-    if not body.code:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "Missing code"},
+    """
+    if not seed_exists():
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Seed not decrypted yet"},
         )
 
     try:
-        if not seed_exists():
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Seed not decrypted yet"},
-            )
+        hex_seed = read_seed()
+        code = generate_totp_code(hex_seed)
 
+        # Remaining seconds in current 30s TOTP window
+        remaining = 30 - int(time.time()) % 30
+
+        return {"code": code, "valid_for": remaining}
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Failed to generate code"},
+        )
+
+
+@app.post("/verify-2fa")
+def verify_2fa(body: Verify2FARequest):
+    """
+    Verify TOTP code with ±1 period tolerance.
+    """
+    # 1. Validate code is provided
+    if not body.code:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing code"},
+        )
+
+    # 2. Check if /data/seed.txt exists
+    if not seed_exists():
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Seed not decrypted yet"},
+        )
+
+    try:
+        # 3. Read hex seed from file
         hex_seed = read_seed()
 
-        # Verify with ±1 period tolerance (±30s)
+        # 4. Verify TOTP code with ±1 period tolerance (valid_window=1)
         is_valid = verify_totp_code(hex_seed, body.code, valid_window=1)
 
+        # 5. Return {"valid": true/false}
         return {"valid": bool(is_valid)}
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("Verify 2FA error:", e)
-        raise HTTPException(status_code=500, detail={"error": "Seed not decrypted yet"})
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Seed not decrypted yet"},
+        )
